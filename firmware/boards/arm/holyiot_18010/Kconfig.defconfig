@@ -1,0 +1,8 @@
+# Holyiot YJ-18010 Kconfig defaults
+
+if BOARD_HOLYIOT_18010
+
+config BOARD
+	default "holyiot_18010"
+
+endif # BOARD_HOLYIOT_18010

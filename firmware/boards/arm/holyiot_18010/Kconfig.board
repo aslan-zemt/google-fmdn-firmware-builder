@@ -1,0 +1,11 @@
+# Holyiot YJ-18010 board configuration
+
+config BOARD_HOLYIOT_18010
+	bool "Holyiot YJ-18010 nRF52840 Module"
+	depends on SOC_NRF52840_QIAA
+	select HAS_NRFX
+	select HAS_HW_NRF_GPIO0
+	select HAS_HW_NRF_GPIO1
+	select HAS_HW_NRF_GPIOTE
+	select HAS_HW_NRF_RADIO_BLE_CODED
+	select HAS_HW_NRF_RADIO_IEEE802154
