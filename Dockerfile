@@ -60,12 +60,12 @@ RUN west init zephyrproject && \
     west update --narrow -o=--depth=1 && \
     west zephyr-export
 
-# Upgrade pip first to get resolver=legacy support
-RUN pip3 install --no-cache-dir --upgrade pip
-
-# Install Zephyr requirements - pin ruamel.yaml first to avoid resolution backtracking
-RUN pip3 install --no-cache-dir "ruamel.yaml==0.18.10" "ruamel.yaml.clib==0.2.14" && \
-    pip3 install --no-cache-dir --resolver=legacy -r /opt/zephyrproject/zephyr/scripts/requirements.txt
+# Upgrade pip and install Zephyr requirements in single layer
+# Use python3 -m pip to ensure upgraded pip is used
+# Pin ruamel.yaml first to avoid resolution backtracking, then use legacy resolver
+RUN python3 -m pip install --no-cache-dir --upgrade pip && \
+    python3 -m pip install --no-cache-dir "ruamel.yaml==0.18.10" "ruamel.yaml.clib==0.2.14" && \
+    python3 -m pip install --no-cache-dir --resolver=legacy -r /opt/zephyrproject/zephyr/scripts/requirements.txt
 
 # Copy firmware source
 WORKDIR /app
