@@ -60,12 +60,17 @@ RUN west init zephyrproject && \
     west update --narrow -o=--depth=1 && \
     west zephyr-export
 
-# Upgrade pip and install Zephyr requirements in single layer
-# Use python3 -m pip to ensure upgraded pip is used
-# Pin ruamel.yaml first to avoid resolution backtracking, then use legacy resolver
-RUN python3 -m pip install --no-cache-dir --upgrade pip && \
-    python3 -m pip install --no-cache-dir "ruamel.yaml==0.18.10" "ruamel.yaml.clib==0.2.14" && \
-    python3 -m pip install --no-cache-dir --resolver=legacy -r /opt/zephyrproject/zephyr/scripts/requirements.txt
+# Upgrade pip for better dependency resolution
+RUN pip3 install --no-cache-dir --upgrade pip setuptools wheel
+
+# Install Zephyr requirements - pin ruamel.yaml to exact versions to prevent backtracking
+# These pinned versions are known to work and prevent the ResolutionTooDeep error
+RUN pip3 install --no-cache-dir "ruamel.yaml==0.18.10" "ruamel.yaml.clib==0.2.14"
+
+# Install remaining Zephyr requirements (ruamel.yaml already satisfied by pinned versions)
+RUN pip3 install --no-cache-dir -r /opt/zephyrproject/zephyr/scripts/requirements.txt || \
+    (echo "Retrying with pip cache disabled..." && pip3 cache purge && \
+     pip3 install --no-cache-dir -r /opt/zephyrproject/zephyr/scripts/requirements.txt)
 
 # Copy firmware source
 WORKDIR /app
