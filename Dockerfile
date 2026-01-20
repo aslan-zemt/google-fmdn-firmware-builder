@@ -60,10 +60,11 @@ RUN west init zephyrproject && \
     west update --narrow -o=--depth=1 && \
     west zephyr-export
 
-# Install Zephyr requirements with legacy resolver to avoid ResolutionTooDeep error
-# Pin problematic packages first
-RUN pip3 install --no-cache-dir "ruamel.yaml>=0.17" "ruamel.yaml.clib>=0.2.7" && \
-    pip3 install --no-cache-dir -r /opt/zephyrproject/zephyr/scripts/requirements.txt || \
+# Upgrade pip first to get resolver=legacy support
+RUN pip3 install --no-cache-dir --upgrade pip
+
+# Install Zephyr requirements - pin ruamel.yaml first to avoid resolution backtracking
+RUN pip3 install --no-cache-dir "ruamel.yaml==0.18.10" "ruamel.yaml.clib==0.2.14" && \
     pip3 install --no-cache-dir --resolver=legacy -r /opt/zephyrproject/zephyr/scripts/requirements.txt
 
 # Copy firmware source
