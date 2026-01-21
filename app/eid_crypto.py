@@ -3,7 +3,12 @@ EID Crypto for Google FMDN
 Generates Ephemeral Identifiers from Entity Identity Keys
 """
 
-from Cryptodome.Cipher import AES
+# pycryptodome can install as Crypto or Cryptodome depending on version
+try:
+    from Cryptodome.Cipher import AES
+except ImportError:
+    from Crypto.Cipher import AES
+
 from ecdsa import SECP160r1
 
 # Constants
