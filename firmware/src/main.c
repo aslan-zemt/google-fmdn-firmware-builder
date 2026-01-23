@@ -17,9 +17,9 @@
 
 #include "entity_pool.h"
 
-/* Advertising interval: 1000-2000ms (power efficient) */
-#define ADV_INTERVAL_MIN  1600  /* 1000ms in 0.625ms units */
-#define ADV_INTERVAL_MAX  3200  /* 2000ms in 0.625ms units */
+/* Advertising interval: 5000ms (power efficient) */
+#define ADV_INTERVAL_MIN  8000  /* 5000ms in 0.625ms units */
+#define ADV_INTERVAL_MAX  8000  /* 5000ms in 0.625ms units */
 
 /* FMDN Frame Constants */
 #define FMDN_UUID_LOW   0xAA
