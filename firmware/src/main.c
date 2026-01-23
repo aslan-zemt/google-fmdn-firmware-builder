@@ -70,10 +70,10 @@ static void load_entity(uint8_t idx)
     current_entity_index = idx;
 }
 
-/* Start advertising */
+/* Start advertising (assumes already stopped) */
 static int start_advertising(void)
 {
-    bt_le_adv_stop();
+    k_msleep(10);  /* Let BLE stack settle */
     return bt_le_adv_start(&adv_param, ad, ARRAY_SIZE(ad), NULL, 0);
 }
 
@@ -85,9 +85,13 @@ static void rotation_handler(struct k_work *work)
 {
     uint8_t next = (current_entity_index + 1) % ENTITY_POOL_SIZE;
 
-    /* Stop, switch entity, restart */
+    /* Stop advertising */
     bt_le_adv_stop();
+
+    /* Update EID */
     load_entity(next);
+
+    /* Restart advertising with small delay */
     start_advertising();
 
     /* Schedule next rotation */
