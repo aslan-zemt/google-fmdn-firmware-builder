@@ -1,15 +1,19 @@
 """
-Google FMDN Firmware Builder Service
-Builds nRF52 firmware using Zephyr RTOS for Google Find My Device Network
+Google FMDN Firmware Builder Service (v2 - Dynamic EID)
+
+Builds nRF52 firmware using Zephyr RTOS for Google Find My Device Network.
+v2: Generates config.h with EIK + serial instead of entity_pool.h with static EIDs.
+The firmware computes EIDs on-device at boot.
 """
 
 import asyncio
 import os
 import json
+import secrets
 import shutil
 from pathlib import Path
 from datetime import datetime
-from typing import List
+from typing import List, Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
@@ -20,7 +24,7 @@ from .eid_crypto import generate_eid, compute_hashed_flags
 app = FastAPI(
     title="Google FMDN Firmware Builder",
     description="Builds Google Find My Device Network firmware for nRF52 trackers",
-    version="1.0.0"
+    version="2.0.0"
 )
 
 # Configuration
@@ -30,14 +34,17 @@ FIRMWARE_SRC = Path("/app/firmware")
 OUTPUT_DIR = Path("/app/output")
 BUILD_DIR = ZEPHYR_PROJECT / "build"
 
-MAX_ENTITIES = 20
+MAX_SLOTS = 20
 EIK_SIZE = 32
+SERIAL_SIZE = 16
 
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
+# --- Data Models ---
+
 class EntityData(BaseModel):
-    """Individual entity data"""
+    """Individual entity data (legacy, for backward compatibility)"""
     name: str
     eik: str  # Hex encoded 32-byte Entity Identity Key
 
@@ -46,8 +53,20 @@ class BuildRequest(BaseModel):
     """Request to build firmware"""
     tracker_id: str = Field(..., description="Unique tracker identifier")
     hardware: str = Field(default="nrf52840", description="Hardware: nrf52840 or nrf52832")
-    entities: List[EntityData] = Field(..., description="List of entities with EIKs")
-    rotation_period: int = Field(default=900, description="Rotation period in seconds")
+    # Legacy: entity list (one EIK per entity)
+    entities: Optional[List[EntityData]] = Field(default=None, description="Legacy: entity list")
+    # v2: Single EIK + serial (dynamic EID on device)
+    eik: Optional[str] = Field(default=None, description="Single EIK (hex, 32 bytes)")
+    tracker_serial: Optional[str] = Field(default=None, description="Tracker serial (hex, 16 bytes)")
+    slot_count: int = Field(default=20, ge=1, le=MAX_SLOTS, description="Number of EID slots")
+    rotation_period: int = Field(default=180, description="Rotation period in seconds")
+
+
+class EIDSlotInfo(BaseModel):
+    """Pre-computed EID info for one slot"""
+    slot_index: int
+    virtual_timestamp: int
+    eid_hex: str
 
 
 class BuildResponse(BaseModel):
@@ -59,6 +78,10 @@ class BuildResponse(BaseModel):
     rotation_period: int
     build_date: str
     download_url: str
+    # v2: pre-computed EIDs for backend registration
+    tracker_serial: Optional[str] = None
+    eik: Optional[str] = None
+    eid_slots: List[EIDSlotInfo] = []
 
 
 class HealthResponse(BaseModel):
@@ -80,11 +103,56 @@ def get_board_name(hardware: str) -> str:
     return boards[hardware]
 
 
+def generate_config_h(eik_hex: str, serial_hex: str,
+                      slot_count: int, rotation_period: int) -> str:
+    """Generate config.h with EIK, serial, and firmware constants."""
+    eik_bytes = bytes.fromhex(eik_hex)
+    serial_bytes = bytes.fromhex(serial_hex)
+
+    eik_c = ', '.join([f'0x{b:02X}' for b in eik_bytes])
+    serial_c = ', '.join([f'0x{b:02X}' for b in serial_bytes])
+
+    # Boot timestamp aligned to 1024s boundary
+    import time
+    boot_ts = int(time.time()) & ~0x3FF
+
+    return f"""/*
+ * Auto-generated Tracker Configuration
+ * Generated: {datetime.utcnow().isoformat()}Z
+ * Slots: {slot_count}, Rotation: {rotation_period}s
+ */
+
+#ifndef CONFIG_H
+#define CONFIG_H
+
+#include <stdint.h>
+
+/* Tracker Identity Key (32 bytes) */
+static const uint8_t TRACKER_EIK[32] = {{
+    {eik_c}
+}};
+
+/* Tracker Serial (16 bytes) */
+static const uint8_t TRACKER_SERIAL[16] = {{
+    {serial_c}
+}};
+
+/* Boot timestamp (aligned to 1024s) */
+#define BOOT_TIMESTAMP {boot_ts}U
+
+/* Slot and rotation config */
+#define SLOT_COUNT          {slot_count}U
+#define ROTATION_PERIOD_SEC {rotation_period}U
+
+#endif /* CONFIG_H */
+"""
+
+
 def generate_entity_pool_h(entities: List[EntityData], rotation_period: int) -> str:
-    """Generate entity_pool.h content from entities"""
+    """Generate legacy entity_pool.h content from entities."""
     lines = [
         "/*",
-        " * Auto-generated Entity Pool",
+        " * Auto-generated Entity Pool (legacy mode)",
         f" * Generated: {datetime.utcnow().isoformat()}Z",
         f" * Entities: {len(entities)}",
         f" * Rotation: {rotation_period}s",
@@ -132,14 +200,28 @@ def generate_entity_pool_h(entities: List[EntityData], rotation_period: int) -> 
     return '\n'.join(lines)
 
 
+def precompute_eids(eik_hex: str, slot_count: int) -> List[EIDSlotInfo]:
+    """Pre-compute EIDs for all slots (for backend registration)."""
+    eik = bytes.fromhex(eik_hex)
+    slots = []
+    for i in range(slot_count):
+        virt_ts = i * 1024
+        eid = generate_eid(eik, timestamp=virt_ts)
+        slots.append(EIDSlotInfo(
+            slot_index=i,
+            virtual_timestamp=virt_ts,
+            eid_hex=eid.hex(),
+        ))
+    return slots
+
+
 async def run_west_build(board: str, firmware_src: Path) -> tuple[bool, str]:
-    """Run west build - uses exec array form (safe, no shell injection)"""
+    """Run west build using subprocess exec (no shell)."""
     cmd = ["west", "build", "-p", "always", "-b", board, str(firmware_src)]
 
     env = os.environ.copy()
     env["ZEPHYR_BASE"] = str(ZEPHYR_BASE)
 
-    # Using create_subprocess_exec (not shell) - safe from injection
     process = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
@@ -162,38 +244,70 @@ async def health_check():
     return HealthResponse(
         status="healthy" if zephyr_ok else "degraded",
         service="Google FMDN Firmware Builder",
-        version="1.0.0",
+        version="2.0.0",
         zephyr_available=zephyr_ok
     )
 
 
 @app.post("/build", response_model=BuildResponse)
 async def build_firmware(request: BuildRequest):
-    """Build firmware with provided entities"""
+    """Build firmware with provided entities or single EIK."""
 
-    if not request.entities:
-        raise HTTPException(status_code=400, detail="No entities provided")
-    if len(request.entities) > MAX_ENTITIES:
-        raise HTTPException(status_code=400, detail=f"Max {MAX_ENTITIES} entities")
+    use_dynamic = request.eik is not None
+    eid_slots: List[EIDSlotInfo] = []
+    tracker_serial = request.tracker_serial
 
-    for entity in request.entities:
-        if len(entity.eik) != EIK_SIZE * 2:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Invalid EIK for {entity.name}"
-            )
+    if use_dynamic:
+        # v2 mode: single EIK, dynamic EID on device
+        if len(request.eik) != EIK_SIZE * 2:
+            raise HTTPException(status_code=400, detail="EIK must be 32 bytes (64 hex chars)")
+
+        if not tracker_serial:
+            tracker_serial = secrets.token_hex(SERIAL_SIZE)
+
+        if len(tracker_serial) != SERIAL_SIZE * 2:
+            raise HTTPException(status_code=400, detail="Serial must be 16 bytes (32 hex chars)")
+
+        # Generate config.h
+        content = generate_config_h(
+            request.eik, tracker_serial,
+            request.slot_count, request.rotation_period,
+        )
+        config_path = FIRMWARE_SRC / "src" / "config.h"
+        with open(config_path, 'w') as f:
+            f.write(content)
+
+        # Pre-compute EIDs for backend registration
+        eid_slots = precompute_eids(request.eik, request.slot_count)
+
+        entity_count = request.slot_count
+
+    elif request.entities:
+        # Legacy mode: multiple entities with static EIDs
+        if len(request.entities) > MAX_SLOTS:
+            raise HTTPException(status_code=400, detail=f"Max {MAX_SLOTS} entities")
+
+        for entity in request.entities:
+            if len(entity.eik) != EIK_SIZE * 2:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid EIK for {entity.name}"
+                )
+
+        content = generate_entity_pool_h(request.entities, request.rotation_period)
+        pool_path = FIRMWARE_SRC / "include" / "entity_pool.h"
+        pool_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(pool_path, 'w') as f:
+            f.write(content)
+
+        entity_count = len(request.entities)
+    else:
+        raise HTTPException(status_code=400, detail="Provide either 'eik' or 'entities'")
 
     try:
         board = get_board_name(request.hardware)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-
-    # Generate entity_pool.h
-    content = generate_entity_pool_h(request.entities, request.rotation_period)
-    pool_path = FIRMWARE_SRC / "include" / "entity_pool.h"
-    pool_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(pool_path, 'w') as f:
-        f.write(content)
 
     # Build
     success, output = await run_west_build(board, FIRMWARE_SRC)
@@ -221,29 +335,45 @@ async def build_firmware(request: BuildRequest):
     firmware_size = out_hex.stat().st_size
 
     # Save metadata
-    entities_data = {
-        "tracker_id": request.tracker_id,
-        "hardware": request.hardware,
-        "entity_count": len(request.entities),
-        "rotation_period": request.rotation_period,
-        "entities": [
-            {"name": e.name, "eik": e.eik, "eid_time0": generate_eid(bytes.fromhex(e.eik), 0).hex()}
-            for e in request.entities
-        ]
-    }
+    build_date = datetime.utcnow().isoformat() + "Z"
+
+    if use_dynamic:
+        entities_data = {
+            "tracker_id": request.tracker_id,
+            "hardware": request.hardware,
+            "mode": "dynamic_eid",
+            "eik": request.eik,
+            "tracker_serial": tracker_serial,
+            "slot_count": request.slot_count,
+            "rotation_period": request.rotation_period,
+            "eid_slots": [s.model_dump() for s in eid_slots],
+        }
+    else:
+        entities_data = {
+            "tracker_id": request.tracker_id,
+            "hardware": request.hardware,
+            "mode": "static_pool",
+            "entity_count": entity_count,
+            "rotation_period": request.rotation_period,
+            "entities": [
+                {"name": e.name, "eik": e.eik, "eid_time0": generate_eid(bytes.fromhex(e.eik), 0).hex()}
+                for e in request.entities
+            ]
+        }
+
     with open(tracker_dir / "entities.json", 'w') as f:
         json.dump(entities_data, f, indent=2)
 
-    build_date = datetime.utcnow().isoformat() + "Z"
     build_info = {
         "tracker_id": request.tracker_id,
         "hardware": request.hardware,
         "firmware_type": "google-fmdn",
-        "version": "1.0.0",
+        "version": "2.0.0",
         "build_date": build_date,
-        "entity_count": len(request.entities),
+        "entity_count": entity_count,
         "rotation_period": request.rotation_period,
-        "firmware_size": firmware_size
+        "firmware_size": firmware_size,
+        "mode": "dynamic_eid" if use_dynamic else "static_pool",
     }
     with open(tracker_dir / "firmware_info.json", 'w') as f:
         json.dump(build_info, f, indent=2)
@@ -252,10 +382,13 @@ async def build_firmware(request: BuildRequest):
         tracker_id=request.tracker_id,
         hardware=request.hardware,
         firmware_size=firmware_size,
-        entity_count=len(request.entities),
+        entity_count=entity_count,
         rotation_period=request.rotation_period,
         build_date=build_date,
-        download_url=f"/download/{request.tracker_id}/firmware.hex"
+        download_url=f"/download/{request.tracker_id}/firmware.hex",
+        tracker_serial=tracker_serial,
+        eik=request.eik if use_dynamic else None,
+        eid_slots=eid_slots,
     )
 
 
